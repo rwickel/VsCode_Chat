@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as l10n from '@vscode/l10n';
+import * as path from 'path';
 import type * as vscode from 'vscode';
 import { createFencedCodeBlock, getLanguageId } from '../../../util/common/markdown';
 import { Result } from '../../../util/common/result';
@@ -40,10 +41,12 @@ import { CodeSearchChunkSearch, CodeSearchRemoteIndexState } from './codeSearch/
 import { BuildIndexTriggerReason, CodeSearchRepoStatus, TriggerIndexingError } from './codeSearch/codeSearchRepo';
 import { EmbeddingsChunkSearch, LocalEmbeddingsIndexState, LocalEmbeddingsIndexStatus } from './embeddingsChunkSearch';
 import { FullWorkspaceChunkSearch } from './fullWorkspaceChunkSearch';
+import { GraphService } from './graphService';
 import { TfidfChunkSearch } from './tfidfChunkSearch';
 import { TfIdfWithSemanticChunkSearch } from './tfidfWithSemanticChunkSearch';
 import { WorkspaceChunkEmbeddingsIndex } from './workspaceChunkEmbeddingsIndex';
 import { IWorkspaceFileIndex } from './workspaceFileIndex';
+import { WorkspaceGraphIndexer } from './workspaceGraphIndexer';
 
 const maxEmbeddingSpread = 0.65;
 
@@ -77,6 +80,7 @@ export interface IWorkspaceChunkSearchService extends IDisposable {
 	readonly _serviceBrand: undefined;
 
 	readonly onDidChangeIndexState: Event<void>;
+	readonly onDidGraphProgress: Event<{ total: number; processed: number; currentFile?: string }>;
 
 	getIndexState(): Promise<WorkspaceIndexState>;
 
@@ -96,6 +100,8 @@ export interface IWorkspaceChunkSearchService extends IDisposable {
 	triggerRemoteIndexing(trigger: BuildIndexTriggerReason, onProgress: (message: string) => void, telemetryInfo: TelemetryCorrelationId, token: CancellationToken): Promise<Result<true, TriggerIndexingError>>;
 
 	deleteExternalIngestWorkspaceIndex(): Promise<void>;
+	getGraphViolations(): Promise<{ type: string; message: string; nodeId: string }[]>;
+	exportGraphDOT(): Promise<string>;
 }
 
 
@@ -116,6 +122,9 @@ export class WorkspaceChunkSearchService extends Disposable implements IWorkspac
 
 	private readonly _onDidChangeIndexState = this._register(new Emitter<void>());
 	readonly onDidChangeIndexState = this._onDidChangeIndexState.event;
+
+	private readonly _onDidGraphProgress = this._register(new Emitter<{ total: number; processed: number; currentFile?: string }>());
+	readonly onDidGraphProgress = this._onDidGraphProgress.event;
 
 	private _impl: WorkspaceChunkSearchServiceImpl | undefined;
 
@@ -154,7 +163,7 @@ export class WorkspaceChunkSearchService extends Disposable implements IWorkspac
 				this._logService.info(`WorkspaceChunkSearchService: using embedding type ${best}`);
 				this._impl = this._register(this._instantiationService.createInstance(WorkspaceChunkSearchServiceImpl, best));
 				this._register(this._impl.onDidChangeIndexState(() => this._onDidChangeIndexState.fire()));
-				this._onDidChangeIndexState.fire();
+				this._register(this._impl.onDidGraphProgress(e => this._onDidGraphProgress.fire(e)));
 
 				return this._impl;
 			}
@@ -220,6 +229,22 @@ export class WorkspaceChunkSearchService extends Disposable implements IWorkspac
 		}
 		return impl.deleteExternalIngestWorkspaceIndex();
 	}
+
+	async getGraphViolations(): Promise<{ type: string; message: string; nodeId: string }[]> {
+		const impl = await this.tryInit(false);
+		if (!impl) {
+			return [];
+		}
+		return impl.getGraphViolations();
+	}
+
+	async exportGraphDOT(): Promise<string> {
+		const impl = await this.tryInit(false);
+		if (!impl) {
+			return '';
+		}
+		return impl.exportGraphDOT();
+	}
 }
 
 class WorkspaceChunkSearchServiceImpl extends Disposable implements IWorkspaceChunkSearchService {
@@ -236,8 +261,13 @@ class WorkspaceChunkSearchServiceImpl extends Disposable implements IWorkspaceCh
 	private readonly _tfidfChunkSearch: TfidfChunkSearch;
 	private readonly _tfIdfWithSemanticChunkSearch: TfIdfWithSemanticChunkSearch;
 
+	private readonly _graphService: GraphService;
+	private readonly _graphIndexer: WorkspaceGraphIndexer;
+
 	private readonly _onDidChangeIndexState = this._register(new Emitter<void>());
 	readonly onDidChangeIndexState = this._onDidChangeIndexState.event;
+
+	readonly onDidGraphProgress: Event<{ total: number; processed: number; currentFile?: string }>;
 
 	private _isDisposed = false;
 
@@ -265,6 +295,18 @@ class WorkspaceChunkSearchServiceImpl extends Disposable implements IWorkspaceCh
 		this._tfidfChunkSearch = this._register(instantiationService.createInstance(TfidfChunkSearch, { tokenizer: TokenizerType.O200K })); // TODO mjbvz: remove hardcoding
 		this._tfIdfWithSemanticChunkSearch = this._register(instantiationService.createInstance(TfIdfWithSemanticChunkSearch, this._tfidfChunkSearch, this._embeddingsIndex));
 		this._codeSearchChunkSearch = this._register(instantiationService.createInstance(CodeSearchChunkSearch, this._embeddingType, this._embeddingsChunkSearch, this._tfIdfWithSemanticChunkSearch));
+
+		const dbPath = path.join(this._extensionContext.storageUri?.fsPath ?? '', 'workspace-graph.db');
+		this._logService.info(`WorkspaceChunkSearchService: Using graph database at ${dbPath}`);
+		this._graphService = new GraphService(dbPath);
+		this._graphIndexer = this._register(instantiationService.createInstance(WorkspaceGraphIndexer, this._embeddingType, this._graphService));
+		this.onDidGraphProgress = this._graphIndexer.onDidProgress;
+
+		this._graphService.initialize().then(() => {
+			this._graphIndexer.start();
+		}).catch((e: unknown) => {
+			this._logService.error(e instanceof Error ? e : String(e), 'Failed to initialize GraphService');
+		});
 
 		this._register(
 			Event.debounce(
@@ -350,6 +392,14 @@ class WorkspaceChunkSearchServiceImpl extends Disposable implements IWorkspaceCh
 
 	deleteExternalIngestWorkspaceIndex(): Promise<void> {
 		return this._codeSearchChunkSearch.deleteExternalIngestWorkspaceIndex(CancellationToken.None);
+	}
+
+	async getGraphViolations(): Promise<{ type: string; message: string; nodeId: string }[]> {
+		return this._graphService.findViolations();
+	}
+
+	async exportGraphDOT(): Promise<string> {
+		return this._graphService.exportDOT();
 	}
 
 	async searchFileChunks(
@@ -859,6 +909,7 @@ class WorkspaceChunkSearchServiceImpl extends Disposable implements IWorkspaceCh
 export class NullWorkspaceChunkSearchService implements IWorkspaceChunkSearchService {
 	_serviceBrand: undefined;
 	onDidChangeIndexState: Event<void> = Event.None;
+	onDidGraphProgress: Event<{ total: number; processed: number; currentFile?: string }> = Event.None;
 	hasFastSearch(sizing: StrategySearchSizing): Promise<boolean> {
 		return Promise.resolve(false);
 	}
@@ -876,6 +927,12 @@ export class NullWorkspaceChunkSearchService implements IWorkspaceChunkSearchSer
 	}
 	deleteExternalIngestWorkspaceIndex(): Promise<void> {
 		return Promise.resolve();
+	}
+	async getGraphViolations(): Promise<{ type: string; message: string; nodeId: string }[]> {
+		return [];
+	}
+	async exportGraphDOT(): Promise<string> {
+		return '';
 	}
 	dispose(): void {
 		// noop

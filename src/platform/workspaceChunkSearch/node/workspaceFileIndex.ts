@@ -25,6 +25,7 @@ import { ConfigKey, IConfigurationService } from '../../configuration/common/con
 import { IFileSystemService } from '../../filesystem/common/fileSystemService';
 import { FileType, RelativePattern } from '../../filesystem/common/fileTypes';
 import { IIgnoreService } from '../../ignore/common/ignoreService';
+import { ILogService } from '../../log/common/logService';
 import { ISearchService } from '../../search/common/searchService';
 import { ITabsAndEditorsService } from '../../tabs/common/tabsAndEditorsService';
 import { IExperimentationService } from '../../telemetry/common/nullExperimentationService';
@@ -496,6 +497,7 @@ export class WorkspaceFileIndex extends Disposable implements IWorkspaceFileInde
 		@ITabsAndEditorsService private readonly _tabsAndEditorsService: ITabsAndEditorsService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IWorkspaceService private readonly _workspaceService: IWorkspaceService,
+		@ILogService private readonly _logService: ILogService,
 	) {
 		super();
 
@@ -675,6 +677,7 @@ export class WorkspaceFileIndex extends Disposable implements IWorkspaceFileInde
 	private _initialized?: Promise<void>;
 	public initialize(): Promise<void> {
 		this._initialized ??= (async () => {
+			this._logService.info(`WorkspaceFileIndex: Initializing. Process CWD: ${process.cwd()}`);
 			this.registerListeners();
 
 			await this._workspaceService.ensureWorkspaceIsFullyLoaded();
@@ -698,6 +701,7 @@ export class WorkspaceFileIndex extends Disposable implements IWorkspaceFileInde
 					"totalFileCount": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Total number of files we can index" }
 				}
 			*/
+			this._logService.info(`WorkspaceFileIndex: Initialized with ${this.fileCount} files from ${this._workspaceService.getWorkspaceFolders().length} workspace folders.`);
 			this._telemetryService.sendMSFTTelemetryEvent('workspaceChunkIndex.initialize', {}, {
 				totalFileCount: this.fileCount
 			});
@@ -717,13 +721,22 @@ export class WorkspaceFileIndex extends Disposable implements IWorkspaceFileInde
 		const cts = new CancellationTokenSource(token);
 
 		try {
+			this._logService.info(`WorkspaceFileIndex: Getting files to index. Workspace folders: ${this._workspaceService.getWorkspaceFolders().map(f => f.toString()).join(', ')}`);
 			for (const folder of this._workspaceService.getWorkspaceFolders() ?? []) {
 				const paths = await raceCancellationError(
 					this._searchService.findFilesWithDefaultExcludes(new RelativePattern(folder, `**/*`), maxResults - resourcesToIndex.size, cts.token),
 					cts.token);
 
+				this._logService.info(`WorkspaceFileIndex: Search service found ${paths.length} paths in ${folder.toString()}`);
+
+				let acceptedCount = 0;
+				let rejectedCount = 0;
 				const tasks = paths.map(async uri => {
 					if (await this.shouldIndexWorkspaceFile(uri, cts.token)) {
+						acceptedCount++;
+						if (acceptedCount <= 5) {
+							this._logService.info(`WorkspaceFileIndex: Accepted file: ${uri.fsPath}`);
+						}
 						if (resourcesToIndex.size < maxResults) {
 							resourcesToIndex.set(uri);
 						}
@@ -731,9 +744,15 @@ export class WorkspaceFileIndex extends Disposable implements IWorkspaceFileInde
 						if (resourcesToIndex.size >= maxResults) {
 							cts.cancel();
 						}
+					} else {
+						rejectedCount++;
+						if (rejectedCount <= 5) {
+							this._logService.info(`WorkspaceFileIndex: Rejected file: ${uri.fsPath}`);
+						}
 					}
 				});
 				await raceCancellationError(Promise.all(tasks), cts.token);
+				this._logService.info(`WorkspaceFileIndex: Folder ${folder.toString()} - Accepted: ${acceptedCount}, Rejected: ${rejectedCount}`);
 			}
 		} catch (e) {
 			if (isCancellationError(e)) {

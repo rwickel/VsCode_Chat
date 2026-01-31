@@ -6,6 +6,7 @@
 import { DisposableStore, IDisposable } from '../../../util/vs/base/common/lifecycle';
 import { IInstantiationService, ServicesAccessor } from '../../../util/vs/platform/instantiation/common/instantiation';
 import * as commands from './commands';
+import { GraphIndexingStatusBarItem } from './graphIndexingStatus';
 import { ChatStatusWorkspaceIndexingStatus } from './workspaceIndexingStatus';
 
 export function create(accessor: ServicesAccessor): IDisposable {
@@ -13,6 +14,7 @@ export function create(accessor: ServicesAccessor): IDisposable {
 
 	const disposableStore = new DisposableStore();
 	disposableStore.add(instantiationService.createInstance(ChatStatusWorkspaceIndexingStatus));
+	disposableStore.add(instantiationService.createInstance(GraphIndexingStatusBarItem));
 	disposableStore.add(commands.register(accessor));
 
 	return disposableStore;
